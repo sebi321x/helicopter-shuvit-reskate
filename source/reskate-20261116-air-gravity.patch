@@ -1,0 +1,600 @@
+--- a/Extension/Plugins/plugin_api_throwdowns.cpp
++++ b/Extension/Plugins/plugin_api_throwdowns.cpp
+@@ -296,6 +296,35 @@
+             if (!(std::abs(a) <= 100)) luaL_argerror(L, 1, "a velocity is at most 100 m/s on each axis");
+         return result(L, game_of(plugin).set_velocity(plugin.id(), v, lua_toboolean(L, 2) != 0));
+     }
++    // air_gravity(factor): scale local on-board gravity for at most 150 ms.
++    // Nil or 1 releases the request. The runtime refuses it in multiplayer.
++    static int air_gravity(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "skater.control", "reskate.skater.air_gravity");
++        const double factor = luaL_optnumber(L, 1, 1);
++        if (!(factor >= 0.2 && factor <= 1.8)) luaL_argerror(L, 1, "air gravity is 0.2 to 1.8 times the player's gravity");
++        return result(L, game_of(plugin).air_gravity(plugin.id(), static_cast<float>(factor)));
++    }
++    // air_descent(speed, strength): ease toward a downward speed for the next 150 ms.
++    static int air_descent(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "skater.control", "reskate.skater.air_descent");
++        const double speed = luaL_checknumber(L, 1);
++        const double strength = luaL_checknumber(L, 2);
++        if (!(speed >= 0.75 && speed <= 6)) luaL_argerror(L, 1, "descent speed is 0.75 to 6 m/s");
++        if (!(strength >= 0 && strength <= 1)) luaL_argerror(L, 2, "descent strength is 0 to 1");
++        return result(L, game_of(plugin).air_descent(plugin.id(), static_cast<float>(speed), static_cast<float>(strength)));
++    }
++    // air_lift(vertical_speed, strength): positive climbs, zero hovers, negative descends.
++    static int air_lift(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "skater.control", "reskate.skater.air_lift");
++        const double speed = luaL_checknumber(L, 1);
++        const double strength = luaL_checknumber(L, 2);
++        if (!(speed >= -6 && speed <= 6)) luaL_argerror(L, 1, "vertical speed is -6 to 6 m/s");
++        if (!(strength >= 0 && strength <= 1)) luaL_argerror(L, 2, "lift strength is 0 to 1");
++        return result(L, game_of(plugin).air_descent(plugin.id(), static_cast<float>(-speed), static_cast<float>(strength)));
++    }
+     // flip_speed(factor): flip tricks in the air turn at factor times their speed (0.05 to 10, times the
+     // player's own flip speed) for the next 300 ms, so call it every tick; 1 or nil ends it. The game
+     // still finishes a slowed flip before the landing.
+@@ -326,6 +355,8 @@
+     lua_pop(L, 1);
+     add_functions(L, "files", {{"list", files_list}, {"read", files_read}, {"write", files_write}, {"remove", files_remove}});
+     add_functions(L, "ui", {{"dialog", dialog}, {"close_dialog", close_dialog}});
+-    add_functions(L, "skater", {{"push", push}, {"push_wait", push_wait}, {"push_reset", push_reset}, {"hold", hold}, {"cruise", cruise}, {"set_velocity", set_velocity}, {"flip_speed", flip_speed}});
++    add_functions(L, "skater", {{"push", push}, {"push_wait", push_wait}, {"push_reset", push_reset}, {"hold", hold}, {"cruise", cruise}, {"set_velocity", set_velocity},
++                                {"air_gravity", air_gravity}, {"air_descent", air_descent}, {"air_lift", air_lift},
++                                {"flip_speed", flip_speed}});
+ }
+ }
+--- a/Extension/Plugins/plugin_game.h
++++ b/Extension/Plugins/plugin_game.h
+@@ -1093,6 +1093,9 @@
+     // The board's velocity set (or `add`ed to) by the next physics step with the skater on its board,
+     // within 500 ms.
+     virtual std::string set_velocity(std::string_view /*plugin*/, const Vec3& /*velocity*/, bool /*add*/) { return unavailable; }
++    // Scale the local skater's on-board flight gravity for the next 150 ms (1 releases).
++    virtual std::string air_gravity(std::string_view /*plugin*/, float /*factor*/) { return unavailable; }
++    virtual std::string air_descent(std::string_view /*plugin*/, float /*speed*/, float /*strength*/) { return unavailable; }
+     // Flip tricks in the air turn at `factor` times their speed for the next 300 ms (1 ends it).
+     virtual std::string flip_speed(std::string_view /*plugin*/, float /*factor*/) { return unavailable; }
+     // What of the pad the game does not see (reskate.input.hide): the triggers, the left stick's
+--- a/Extension/Plugins/plugin_game_runtime.cpp
++++ b/Extension/Plugins/plugin_game_runtime.cpp
+@@ -975,6 +975,16 @@
+         set_plugin_velocity(velocity, add);
+         return {};
+     }
++    std::string air_gravity(std::string_view plugin, float factor) override {
++        if (factor != 1 && multiplayer_session_active()) return "air gravity is only available offline";
++        if (factor != 1 && (!input_allowed() || multiplayer::local_throwdown_active())) return "air gravity is unavailable here";
++        return trainer::plugin_air_gravity(plugin, factor);
++    }
++    std::string air_descent(std::string_view plugin, float speed, float strength) override {
++        if (strength > 0 && multiplayer_session_active()) return "air descent is only available offline";
++        if (strength > 0 && (!input_allowed() || multiplayer::local_throwdown_active())) return "air descent is unavailable here";
++        return strength > 0 ? trainer::plugin_air_gravity(plugin, strength, speed) : trainer::plugin_air_gravity(plugin, 1);
++    }
+     // A flip's speed is a trick setting like the trainer's flip speed: the host's word and no throwdown.
+     std::string flip_speed(std::string_view plugin, float factor) override {
+         if (factor != 1 && multiplayer_session_active() && !session_boosts_allowed()) return "the host has turned boosts off";
+--- a/Extension/Trainer/trainer.h
++++ b/Extension/Trainer/trainer.h
+@@ -239,5 +239,6 @@
+ // `hold_ms`, so a plugin calls it every tick; 1 lets go. Every plugin's factors multiply. Empty when done, else why not.
+ std::string plugin_flip_speed(std::string_view owner, float factor, unsigned hold_ms);
+ // Lets go of this plugin's values and flip speed.
++std::string plugin_air_gravity(std::string_view owner, float factor, std::optional<float> descent_speed = {});
+ void release_plugin_tunes(std::string_view owner);
+ } // namespace dingosdk::trainer
+--- a/Extension/Trainer/trainer.cpp
++++ b/Extension/Trainer/trainer.cpp
+@@ -159,6 +159,13 @@
+         std::uint64_t until{};
+     };
+     std::map<std::string, PluginFlip, std::less<>> plugin_flips;
++    struct PluginAirGravity {
++        std::string owner;
++        float factor{1};
++        std::optional<float> descent_speed;
++        std::uint64_t until{};
++    };
++    std::optional<PluginAirGravity> plugin_air_gravity;
+     UserPresets user;                                                                   // presets
+     std::vector<std::string> active;                                                    // presets applied since Stock
+     std::map<std::string, MapData, std::less<>> maps;
+@@ -3002,13 +3009,26 @@
+         {
+             // Gravity: the game's own under a host's physics or with boosts off. Both levers let go by themselves.
+             const bool stock_gravity = s.enforced || (multiplayer_session_active() && !session_boosts_allowed());
+-            float board = stock_gravity ? 1.0f : s.gravity, foot = board;
++            const float board = stock_gravity ? 1.0f : s.gravity;
++            float flight_factor = 1.0f;
++            std::optional<float> descent_speed;
++            std::uint64_t flight_until = 0;
++            if (s.plugin_air_gravity) {
++                const auto& request = *s.plugin_air_gravity;
++                if (!s.motion.airborne || request.until <= now || stock_gravity || multiplayer_session_active()) {
++                    s.plugin_air_gravity.reset();
++                } else {
++                    flight_factor = request.factor;
++                    descent_speed = request.descent_speed;
++                    flight_until = request.until;
++                }
++            }
+             // Under a host's physics or with boosts off the advanced levers let go with the gravity.
+             const bool own = board != 1.0f || (s.gravity_landing_own && s.gravity_landing != 1.0f);
+             set_air_gravity(client, s.entity, board, !own || stock_gravity ? 1.0f : s.gravity_landing_own ? s.gravity_landing : 0.0f,
+-                            board == 1.0f ? 0.0f : s.gravity_timing);
++                            board == 1.0f ? 0.0f : s.gravity_timing, flight_factor, flight_until, descent_speed);
+             air_gravity_now = board;
+-            if (const bool live = set_foot_gravity(foot); live != s.gravity_live) {
++            if (const bool live = set_foot_gravity(board); live != s.gravity_live) {
+                 s.gravity_live = live;
+                 s.view_due = true;
+             }
+@@ -3852,8 +3872,34 @@
+     s.plugin_flips.insert_or_assign(std::string(owner), State::PluginFlip{std::clamp(factor, flip_low, 10.0f), now + hold_ms});
+     return {};
+ }
++std::string plugin_air_gravity(std::string_view owner, float factor, std::optional<float> descent_speed) {
++    auto &s = state();
++    auto &request = s.plugin_air_gravity;
++    const auto now = GetTickCount64();
++    if (request && request->until <= now) request.reset();
++    if (factor == 1 && !descent_speed) {
++        if (request && request->owner == owner) request.reset();
++        return {};
++    }
++    if (!descent_speed) {
++        if (!(factor >= 0.2f && factor <= 1.8f)) return "air gravity is 0.2 to 1.8 times the player's gravity";
++    } else if (!(*descent_speed >= -6.0f && *descent_speed <= 6.0f && factor > 0 && factor <= 1)) {
++        return "air lift needs a vertical speed of -6 to 6 m/s and a strength above 0 through 1";
++    }
++    if (s.enforced || multiplayer_session_active()) return "air gravity is only available offline";
++    if (request && request->owner != owner) return request->owner + " already holds air gravity";
++    if (request) {
++        request->factor = factor;
++        request->descent_speed = descent_speed;
++        request->until = now + 150;
++    } else {
++        request = State::PluginAirGravity{std::string(owner), factor, descent_speed, now + 150};
++    }
++    return {};
++}
+ void release_plugin_tunes(std::string_view owner) {
+     auto &s = state();
++    if (s.plugin_air_gravity && s.plugin_air_gravity->owner == owner) s.plugin_air_gravity.reset();
+     if (const auto found = s.plugin_flips.find(owner); found != s.plugin_flips.end()) s.plugin_flips.erase(found);
+     std::vector<std::string> mine;
+     for (const auto &[key, tune] : s.plugin_tunes)
+--- a/Extension/Plugins/Test/plugin_tests.cpp
++++ b/Extension/Plugins/Test/plugin_tests.cpp
+@@ -699,6 +699,10 @@
+         calls.push_back(std::format("velocity {} {:.1f} {:.1f} {:.1f}{}", plugin, v[0], v[1], v[2], add ? " add" : ""));
+         return {};
+     }
++    std::string air_gravity(std::string_view plugin, float factor) override {
++        calls.push_back(std::format("air gravity {} {:.2f}", plugin, factor));
++        return {};
++    }
+     std::string flip_speed(std::string_view plugin, float factor) override {
+         calls.push_back(std::format("flip speed {} {:.2f}", plugin, factor));
+         return {};
+@@ -4606,6 +4610,27 @@
+     ticks(host, environment, 1);
+     check(environment.logged("[sneaky] false false false false false"), "viewmodel is needed\n" + environment.all());
+     check(game.viewmodeler.empty(), "Given up when its plugin stops\n" + environment.all());
++}
++
++void plugins_scale_on_board_air_gravity() {
++    TestEnvironment environment;
++    auto& game = environment.fake;
++    Host host(environment, Side::client);
++    host.apply({package("glide", {{manifest_file, manifest(R"("skater.control")")}, {"plugin/main.lua", R"(
++        local set = reskate.skater.air_gravity
++        assert(set(0.2) and set(1.8) and set())
++        assert(not pcall(set, 0.1) and not pcall(set, 1.9) and not pcall(set, 0 / 0))
++    )"}})});
++    ticks(host, environment, 1);
++    running(host, "glide", environment);
++    check(game.called("air gravity glide 0.20") && game.called("air gravity glide 1.80") &&
++          game.called("air gravity glide 1.00"), "Release and both signs reach the game backend");
++    host.apply({package("denied", {{manifest_file, manifest()}, {"plugin/main.lua", R"(
++        assert(not pcall(reskate.skater.air_gravity, 0.5))
++    )"}})});
++    ticks(host, environment, 1);
++    running(host, "denied", environment);
++    check(!game.called("air gravity denied 0.50"), "A plugin without skater.control cannot reach the game backend");
+ }
+ 
+ // A flip mode's speed: flip tricks in the air turned slower or faster for a moment, 1 or nothing to let go.
+@@ -7540,6 +7565,7 @@
+ #endif
+         run(plugins_reach_cruise_and_read_the_mouse);
+         run(plugins_set_the_flip_speed);
++        run(plugins_scale_on_board_air_gravity);
+         run(plugins_show_a_viewmodel);
+         run(plugins_carry_and_take_a_step_in_the_camera_cycle);
+         run(plugins_read_joints_and_tune_physics);
+--- a/Extension/Progression/script_error_log.cpp
++++ b/Extension/Progression/script_error_log.cpp
+@@ -14,7 +14,7 @@
+ void script_error(std::uintptr_t, std::uintptr_t*, std::uintptr_t* arguments) {
+     PreserveError preserve;
+     // Authored graphs raise the same error every frame, from the same constant text: a text
+-    // pointer already looked at is not read again (each character was a system call).
++    // pointer already looked at is not read again, so failed probes are cheap.
+     static std::mutex mutex; static std::set<std::string> seen; static std::set<std::uintptr_t> looked_at, arguments_seen;
+     std::lock_guard lock(mutex);
+     try {
+@@ -26,7 +26,7 @@
+             if (looked_at.size() < 4096) looked_at.insert(at);
+             for (std::size_t i = 0; at && i < 400; ++i) {
+                 char c{};
+-                if (!memory::peek(at + i, c) || !c) break; // no system call per character
++                if (!memory::read(at + i, c) || !c) break;
+                 if (static_cast<unsigned char>(c) < 9 || static_cast<unsigned char>(c) > 126) return std::string{};
+                 value += static_cast<unsigned char>(c) < 32 ? ' ' : c;
+             }
+@@ -35,7 +35,7 @@
+         std::string message;
+         for (std::size_t index = 0; arguments && index < 4 && message.empty(); ++index) {
+             std::uintptr_t argument{}, inner{};
+-            if (!memory::peek(reinterpret_cast<std::uintptr_t>(arguments) + index * 8, argument) || argument < 0x10000) break;
++            if (!memory::read(reinterpret_cast<std::uintptr_t>(arguments) + index * 8, argument) || argument < 0x10000) break;
+             // The same arguments come back every frame: each is probed once (read, not peeked:
+             // it is often not a pointer, and a failed peek costs an exception).
+             if (arguments_seen.contains(argument)) continue;
+--- a/Engine/Core/Platform/memory.h
++++ b/Engine/Core/Platform/memory.h
+@@ -21,6 +21,10 @@
+ // that run every game frame. Use peek there, for game objects expected to be readable; a
+ // failed peek costs an exception, so keep read for probing addresses that are often invalid.
+ inline bool peek_bytes(std::uintptr_t address, void* destination, std::size_t size) noexcept {
++#if defined(__clang__)
++    // Clang can inline the copy outside the Windows exception scope in optimized builds.
++    return read_bytes(address, destination, size);
++#else
+     if (!destination || !size || size > highest_user_address || address < 0x10000 ||
+         address > highest_user_address - size) return false;
+     __try {
+@@ -29,6 +33,7 @@
+     } __except (EXCEPTION_EXECUTE_HANDLER) {
+         return false;
+     }
++#endif
+ }
+ template<class T> requires std::is_trivially_copyable_v<T>
+ bool peek(std::uintptr_t address, T& value) noexcept { return peek_bytes(address, &value, sizeof(value)); }
+@@ -64,7 +69,26 @@
+ // or -1 if it is unreadable or has no terminator within capacity bytes. Reads byte by byte, so it never
+ // touches memory past the terminator.
+ inline std::ptrdiff_t peek_cstring(std::uintptr_t address, char* destination, std::size_t capacity) noexcept {
+-    if (!destination || !capacity || address < 0x10000 || address > highest_user_address - capacity) return -1;
++    if (!destination || !capacity || capacity > highest_user_address || address < 0x10000 ||
++        address > highest_user_address - capacity) return -1;
++#if defined(__clang__)
++    // Stop at page boundaries so a valid string at the end of a page still succeeds.
++    static const std::size_t page_size = [] {
++        SYSTEM_INFO info{};
++        GetSystemInfo(&info);
++        return static_cast<std::size_t>(info.dwPageSize);
++    }();
++    for (std::size_t offset = 0; offset < capacity;) {
++        const auto page_left = page_size - (address + offset) % page_size;
++        const auto left = capacity - offset;
++        const auto bytes = left < page_left ? left : page_left;
++        if (!read_bytes(address + offset, destination + offset, bytes)) return -1;
++        const auto* end = static_cast<const char*>(std::memchr(destination + offset, '\0', bytes));
++        if (end) return end - destination;
++        offset += bytes;
++    }
++    return -1;
++#else
+     __try {
+         const auto* source = reinterpret_cast<const char*>(address);
+         for (std::size_t i = 0; i < capacity; ++i) {
+@@ -75,5 +99,6 @@
+     } __except (EXCEPTION_EXECUTE_HANDLER) {
+         return -1;
+     }
++#endif
+ }
+ }
+--- a/Extension/Skater/client_source_spawn.h
++++ b/Extension/Skater/client_source_spawn.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ #include <cstdint>
+ #include <array>
++#include <optional>
+ #include <string>
+ #include "Extension/UI/Overlay/overlay.h"
+ 
+@@ -44,7 +45,8 @@
+ // landing: the gravity the game plans landings with, as a multiple of its own (0: the same as factor). timing: 0 the game's
+ // own animation timing in the air, 1 the timing the flight would have at the game's gravity (air_animation_rate is the
+ // rate that gives it, 1 on the ground).
+-void set_air_gravity(std::uintptr_t client, std::uintptr_t entity, float factor, float landing = 0, float timing = 0) noexcept;
++void set_air_gravity(std::uintptr_t client, std::uintptr_t entity, float factor, float landing = 0, float timing = 0,
++                     float flight_factor = 1, std::uint64_t flight_until = 0, std::optional<float> descent_speed = {}) noexcept;
+ float air_animation_rate() noexcept;
+ std::uint32_t air_gravity_steps() noexcept;
+ // Trainer: the game has just launched a flight with this trajectory object (any skater's; any thread).
+--- a/Extension/Skater/client_noclip.cpp
++++ b/Extension/Skater/client_noclip.cpp
+@@ -551,15 +551,30 @@
+ // so the trainer writes its gravity after each physics step, and lets go by writing nothing.
+ constexpr std::uintptr_t flight_record_gravity = 0x18a0, trajectory_context = 0xb808;
+ constexpr float game_gravity = -9.8f;
++struct FlightControl {
++    static constexpr float fixed_gravity = 7.0f; // Outside the range of signed speed targets.
++    float factor{1};
++    float descent_speed{fixed_gravity};
++    bool controlled() const noexcept { return descent_speed != fixed_gravity; }
++    bool active() const noexcept { return factor != 1 || controlled(); }
++};
+ struct AirGravity {
+     std::atomic<float> factor{1};
+     std::atomic<std::uint64_t> expires{};
++    std::atomic<FlightControl> flight_control{};
++    std::atomic<std::uint64_t> flight_until{};
+     std::atomic<std::uintptr_t> client{}, entity{};
+     std::atomic<std::uint32_t> steps{};
+     // The trajectory objects the game has launched lately (the local skater's is the one that points at its context).
+     std::array<std::atomic<std::uintptr_t>, 8> records{};
+     std::atomic<std::uint32_t> noted{};
+     std::uintptr_t held{}; // physics thread: the record whose gravity is the trainer's now
++    std::atomic<std::uintptr_t> flight_held{};
++    using AdvanceCurve = void (*)(std::uintptr_t);
++    std::atomic<AdvanceCurve> advance_curve{};
++    std::atomic<unsigned> curve_steps{}, integrated_steps{}, descent_steps{}, observed_state{};
++    std::atomic<float> integrated_delta{};
++    std::uint64_t report_after{}; // client thread
+     std::uintptr_t searches{}; // physics thread: the landing searches' gravity (below) the trainer wrote, 0 when stock
+     // The landing searches' gravity (0: factor), and how far the air animations keep the game's timing (0 .. 1).
+     std::atomic<float> landing{}, timing{};
+@@ -605,6 +620,158 @@
+ // part of the way. The countdown is planned with the landing gravity, the flight falls with the trainer's.
+ constexpr std::uintptr_t core_animation_offset = 0x3b8, animation_output_offset = 0x10, output_landing_countdown = 0xd8;
+ constexpr std::uintptr_t flight_record_velocity = 0x1890;
++// The animation-driven air state samples this block at its current frame.
++// See the position and velocity samplers at 0x474ea20 and 0x474ea70.
++constexpr std::uintptr_t flight_record_start = 0x1880, flight_record_dt = 0x18b4;
++constexpr std::uintptr_t core_active_state = 0x3b0, core_animated_air = 0x308;
++constexpr std::uintptr_t air_state_record = 0x30, air_state_frame = 0x4dc;
++constexpr std::uintptr_t air_state_context = 0x08;
++constexpr std::uintptr_t core_integrated_air = 0x2f8, integrated_air_flag = 0x96d, integrated_air_gravity_y = 0x934;
++constexpr std::uintptr_t advance_curve_rva = 0x48256b0;
++constexpr std::array<unsigned char, 22> advance_curve_prefix{
++    0x4c,0x8b,0xdc,0x53,0x48,0x81,0xec,0x50,0x02,0x00,0x00,0x48,0x8b,0x05,0xfe,0xec,0x99,0x02,0x48,0x33,0xc4,0x48
++};
++
++FlightControl plugin_flight_control(const AirGravity& g) noexcept {
++    if (GetTickCount64() >= g.flight_until.load(std::memory_order_acquire)) return {};
++    return g.flight_control.load(std::memory_order_relaxed);
++}
++
++float base_flight_gravity(const AirGravity& g) noexcept {
++    return GetTickCount64() < g.expires.load(std::memory_order_acquire)
++        ? game_gravity * g.factor.load(std::memory_order_relaxed) : game_gravity;
++}
++
++float wanted_flight_gravity(float baseline, float velocity, FlightControl control) noexcept {
++    if (!control.controlled())
++        return std::clamp(baseline * control.factor, -196.0f, -0.196f);
++    // A proportional correction converges to the chosen vertical speed while bounding
++    // acceleration, even at the end of a long fall.
++    const float target = std::clamp((-control.descent_speed - velocity) * 5.0f, baseline, 18.0f);
++    return std::lerp(baseline, target, control.factor);
++}
++
++bool rebase_flight_gravity(std::uintptr_t record, float time, float baseline, FlightControl control, bool held, float& wanted) {
++    SourceReader reader;
++    const auto address = record + flight_record_start;
++    std::array<float, 12> curve{};
++    if (!reader.raw(address, curve.data(), sizeof(curve))) return false;
++    reader.verify();
++    const float time_limit = held && !control.active() ? 60.0f : 30.0f;
++    if (!(time >= 0 && time <= time_limit) || !std::isfinite(curve[1]) || !std::isfinite(curve[5]) ||
++        curve[8] != 0 || curve[10] != 0 || !(curve[9] > -250.0f && curve[9] <= (held ? 18.0f : -0.1f))) return false;
++    const float velocity = curve[5] + curve[9] * time;
++    if (!std::isfinite(velocity)) return false;
++    wanted = wanted_flight_gravity(baseline, velocity, control);
++    if (curve[9] == wanted) return true;
++
++    // Keep p(t) and v(t) at the current sample; only the acceleration changes.
++    const float change = wanted - curve[9];
++    curve[1] += 0.5f * change * time * time;
++    curve[5] -= change * time;
++    curve[9] = wanted;
++    return source_writable(address, sizeof(curve)) && copy_to(address, &curve, sizeof(curve));
++}
++
++// The game's 201 step advances the frame at entry, then evaluates the curve before placing the rig.
++// Apply the change at that call, anchored at the previous frame's position and velocity.
++void advance_plugin_flight_curve(std::uintptr_t state) {
++    auto& g = air_gravity();
++    const auto original = g.advance_curve.load(std::memory_order_acquire);
++    const auto control = plugin_flight_control(g);
++    std::uintptr_t record{};
++    int frame{};
++    float dt{}, wanted{}, baseline{};
++    bool applied = false;
++    if (control.active() || g.flight_held.load(std::memory_order_relaxed)) {
++        SourceLastError error;
++        try {
++            NoBailSkater owner;
++            SourceReader reader;
++            if (no_bail_skater(owner) && owner.entity == g.entity.load(std::memory_order_relaxed) &&
++                reader.pointer(owner.core, core_animated_air) == state &&
++                reader.pointer(state, air_state_context) == owner.context) {
++                record = reader.pointer(state, air_state_record);
++                const auto held = g.flight_held.load(std::memory_order_relaxed);
++                if (record && (control.active() || held == record) && reader.pointer(record, trajectory_context) == owner.context) {
++                    frame = reader.value<std::int32_t>(state, air_state_frame);
++                    dt = reader.value<float>(record, flight_record_dt);
++                    reader.verify();
++                    baseline = base_flight_gravity(g);
++                    if (frame >= 0 && dt >= 0.001f && dt <= 0.05f) {
++                        applied = rebase_flight_gravity(record, frame * dt, baseline, control, held == record, wanted);
++                        if (applied) g.flight_held.store(wanted != baseline ? record : 0, std::memory_order_relaxed);
++                    }
++                } else if (held && held != record) {
++                    g.flight_held.store(0, std::memory_order_relaxed);
++                }
++            }
++        } catch (...) {}
++    }
++    original(state);
++    if (applied && wanted != baseline) {
++        SourceLastError error;
++        int after{};
++        float consumed{};
++        if (memory::peek(state + air_state_frame, after) && after == frame + 1 &&
++            memory::peek(record + flight_record_gravity + 4, consumed) && consumed == wanted) {
++            g.curve_steps.fetch_add(1, std::memory_order_relaxed);
++            if (control.controlled()) g.descent_steps.fetch_add(1, std::memory_order_relaxed);
++            g.integrated_delta.fetch_add((wanted - baseline) * dt, std::memory_order_relaxed);
++        }
++    }
++}
++
++struct ScopedIntegratedFlight {
++    std::uintptr_t address{}, object{};
++    float before{}, written{}, step{}, velocity{};
++    bool descent{};
++    void prepare(std::uintptr_t core, FlightControl control) {
++        NoBailSkater owner;
++        SourceReader reader;
++        if (!no_bail_skater(owner) || core != owner.core || owner.entity != air_gravity().entity.load(std::memory_order_relaxed)) return;
++        const auto state = reader.pointer(core, core_active_state);
++        if (!state || state != reader.pointer(core, core_integrated_air) ||
++            reader.pointer(state, air_state_context) != owner.context ||
++            reader.value<std::uint8_t>(state, integrated_air_flag) != 1) return;
++        before = reader.value<float>(state, integrated_air_gravity_y);
++        step = reader.value<float>(owner.context, 0x17ec);
++        velocity = reader.value<float>(state, 0x924);
++        reader.verify();
++        if (!(before < -0.1f && before > -250.0f && step >= 0.001f && step <= 0.05f) || !std::isfinite(velocity)) return;
++        const auto target = state + integrated_air_gravity_y;
++        written = wanted_flight_gravity(before, velocity, control);
++        if (written != before && source_writable(target, sizeof(written)) && copy_to(target, &written, sizeof(written))) {
++            address = target;
++            object = state;
++            descent = control.controlled();
++        }
++    }
++    void finish() const noexcept {
++        float now{};
++        if (address && memory::peek(address, now) && now == written && copy_to(address, &before, sizeof(before))) {
++            float vertical{};
++            if (!memory::peek(object + 0x924, vertical) || std::abs(vertical - (velocity + written * step)) > 0.01f) return;
++            auto& g = air_gravity();
++            g.integrated_steps.fetch_add(1, std::memory_order_relaxed);
++            if (descent) g.descent_steps.fetch_add(1, std::memory_order_relaxed);
++            g.integrated_delta.fetch_add((written - before) * step, std::memory_order_relaxed);
++        }
++    }
++};
++
++bool install_plugin_flight_curve(std::uintptr_t base) noexcept {
++    auto& g = air_gravity();
++    std::array<unsigned char, advance_curve_prefix.size()> bytes{};
++    if (!memory::peek(base + advance_curve_rva, bytes) || bytes != advance_curve_prefix) return false;
++    auto* target = reinterpret_cast<void*>(base + advance_curve_rva);
++    void* original{};
++    if (hook_prepare(target, reinterpret_cast<void*>(&advance_plugin_flight_curve), &original) != HookOk) return false;
++    if (!original) { (void)hook_remove(target); return false; }
++    g.advance_curve.store(reinterpret_cast<AirGravity::AdvanceCurve>(original), std::memory_order_release);
++    return hook_enable(target) == HookOk;
++}
++
+ void air_gravity_animation(AirGravity& g, std::uintptr_t core, std::uintptr_t record, float factor, float landing, float timing) {
+     SourceReader reader;
+     const auto animation = reader.pointer(core, core_animation_offset);
+@@ -641,7 +808,8 @@
+     float factor = g.factor.load(std::memory_order_relaxed);
+     float landing = g.landing.load(std::memory_order_relaxed);
+     const float timing = g.timing.load(std::memory_order_relaxed);
+-    if (GetTickCount64() >= g.expires.load(std::memory_order_acquire)) factor = 1, landing = 1;
++    const auto now_ms = GetTickCount64();
++    if (now_ms >= g.expires.load(std::memory_order_acquire)) factor = 1, landing = 1;
+     if (!(landing > 0)) landing = factor;
+     if (factor == 1 && landing == 1 && !g.held && !g.searches) {
+         g.animation_rate.store(1.0f, std::memory_order_relaxed);
+@@ -665,7 +833,9 @@
+             // Only a record that reads as a gravity is written: straight down, and the game's or one of the trainer's.
+             if (context != bodies.context || now[0] != 0 || now[2] != 0 || !(now[1] < -0.1f) || !(now[1] > -250.0f)) continue;
+             const float wanted = game_gravity * factor;
+-            if (now[1] != wanted) body_write(record + flight_record_gravity + 4, wanted);
++            if (g.flight_held.load(std::memory_order_relaxed) != record && now[1] != wanted) {
++                body_write(record + flight_record_gravity + 4, wanted);
++            }
+             g.held = factor == 1 ? 0 : record;
+             if (factor != 1) g.steps.fetch_add(1, std::memory_order_relaxed);
+             if (factor != 1 && timing > 0) air_gravity_animation(g, core, record, factor, landing, timing);
+@@ -1073,7 +1243,19 @@
+ }
+ void noclip_physics_update(std::uintptr_t core) {
+     const auto original = source_state().velocity_update_original.load(std::memory_order_acquire);
+-    if (original) original(core);
++    if (original) {
++        ScopedIntegratedFlight integrated;
++        const auto flight_control = plugin_flight_control(air_gravity());
++        if (flight_control.active()) {
++            SourceLastError error;
++            try { integrated.prepare(core, flight_control); } catch (...) {}
++        }
++        original(core);
++        if (integrated.address) {
++            SourceLastError error;
++            integrated.finish();
++        }
++    }
+     noclip_apply_velocity(core);
+     trainer_apply_jump_scale(core);
+     if (const auto callback = physics_step_callback.load(std::memory_order_acquire)) callback();
+@@ -1245,14 +1427,31 @@
+     p.factor.store(factor > 0.02f && factor <= 1.0e6f ? factor : 1.0f, std::memory_order_relaxed);
+     p.expires.store(GetTickCount64() + 500, std::memory_order_release);
+ }
+-void set_air_gravity(std::uintptr_t client, std::uintptr_t entity, float factor, float landing, float timing) noexcept {
++void set_air_gravity(std::uintptr_t client, std::uintptr_t entity, float factor, float landing, float timing,
++                     float flight_factor, std::uint64_t flight_until, std::optional<float> descent_speed) noexcept {
+     auto& g = air_gravity();
+     g.landing.store(std::isfinite(landing) && landing >= 0.02f && landing <= 20.0f ? landing : 0.0f, std::memory_order_relaxed);
+     g.timing.store(std::isfinite(timing) ? std::clamp(timing, 0.0f, 1.0f) : 0.0f, std::memory_order_relaxed);
+     g.client.store(client, std::memory_order_relaxed);
+     g.entity.store(entity, std::memory_order_relaxed);
+     g.factor.store(std::isfinite(factor) && factor >= 0.02f && factor <= 20.0f ? factor : 1.0f, std::memory_order_relaxed);
+-    g.expires.store(GetTickCount64() + 500, std::memory_order_release);
++    const auto now = GetTickCount64();
++    g.expires.store(now + 500, std::memory_order_release);
++    const FlightControl control{flight_factor, descent_speed.value_or(FlightControl::fixed_gravity)};
++    g.flight_control.store(control, std::memory_order_relaxed);
++    g.flight_until.store(flight_until, std::memory_order_release);
++    if (control.active() && flight_until > now) {
++        g.report_after = now + 300;
++        const auto state = watched_physics_state();
++        if (state.valid) g.observed_state.store(state.state, std::memory_order_relaxed);
++    } else if (g.report_after && now >= g.report_after) {
++        g.report_after = 0;
++        logging::log(logging::Level::info, logging::Channel::skater,
++            "Plugin flight gravity: {} curve steps, {} integrated steps, {} controlled-lift steps, {:+.3f} m/s from sampled acceleration (last requested state {}).",
++            g.curve_steps.exchange(0, std::memory_order_relaxed), g.integrated_steps.exchange(0, std::memory_order_relaxed),
++            g.descent_steps.exchange(0, std::memory_order_relaxed),
++            g.integrated_delta.exchange(0, std::memory_order_relaxed), g.observed_state.exchange(0, std::memory_order_relaxed));
++    }
+ }
+ float air_animation_rate() noexcept {
+     auto& g = air_gravity();
+@@ -1346,6 +1545,8 @@
+         // Keep trampolines on uncertain enable results; handlers still forward.
+         if (hook_enable(target) != HookOk || hook_enable(motion_target) != HookOk) return false;
+         state.velocity_guard_active.store(true, std::memory_order_release);
++        if (!install_plugin_flight_curve(base))
++            logging::write(logging::Level::warning, logging::Channel::skater, "Plugin flight gravity: the animated flight hook did not install.");
+         return true;
+     } catch (...) { return false; }
+ }

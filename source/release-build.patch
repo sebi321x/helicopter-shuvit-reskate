@@ -1,0 +1,38 @@
+--- a/Extension/UI/NativeMenu/native_menu.cpp
++++ b/Extension/UI/NativeMenu/native_menu.cpp
+@@ -59,7 +59,7 @@
+     } catch (...) { }
+ }
+ template<unsigned Slot, std::size_t... I> auto callbacks(std::index_sequence<I...>) {
+-    return std::array{&activate<Slot, I>...};
++    return std::array<void (*)(), sizeof...(I)>{&activate<Slot, I>...};
+ }
+ } // namespace
+ namespace native_menu_detail {
+--- a/Extension/UI/Overlay/skate_menu.cpp
++++ b/Extension/UI/Overlay/skate_menu.cpp
+@@ -1338,7 +1338,8 @@
+     static const ImWchar ranges[]{0x0020, 0x024F, 0x0400, 0x052F, 0x2000, 0x206F, 0x20A0, 0x20CF, 0x2190, 0x21FF, 0};
+     std::array<char, MAX_PATH> windows{};
+     const auto length = GetWindowsDirectoryA(windows.data(), static_cast<UINT>(windows.size()));
+-    const auto font = [&](const wchar_t* resource, const char* filename, float size, const ImWchar* glyphs = ranges) -> ImFont* {
++    const auto font = [&](const wchar_t* resource, const char* filename, float size, const ImWchar* glyphs = nullptr) -> ImFont* {
++        if (!glyphs) glyphs = ranges;
+         if (resource)
+             if (auto* loaded = embedded_font(resource, size, glyphs)) return loaded;
+         if (length && length < windows.size()) {
+--- a/cmake/Runtime.cmake
++++ b/cmake/Runtime.cmake
+@@ -312,7 +312,11 @@
+ find_program(DINGOSDK_CARGO cargo HINTS "$ENV{USERPROFILE}/.cargo/bin")
+ set(dingosdk_spotify_dir "${PROJECT_SOURCE_DIR}/SpotifyHelper")
+ if(WIN32 AND DINGOSDK_CARGO AND EXISTS "${dingosdk_spotify_dir}/Cargo.toml")
+-    set(dingosdk_spotify_lib "${dingosdk_spotify_dir}/target/release/reskate_spotify.lib")
++    set(dingosdk_spotify_target "")
++    if(NOT "$ENV{CARGO_BUILD_TARGET}" STREQUAL "")
++        set(dingosdk_spotify_target "$ENV{CARGO_BUILD_TARGET}/")
++    endif()
++    set(dingosdk_spotify_lib "${dingosdk_spotify_dir}/target/${dingosdk_spotify_target}release/reskate_spotify.lib")
+     # Every module of the library (stream.rs changed alone did not rebuild it when only lib.rs was named).
+     file(GLOB dingosdk_spotify_sources CONFIGURE_DEPENDS "${dingosdk_spotify_dir}/src/*.rs")
+     add_custom_command(OUTPUT "${dingosdk_spotify_lib}"

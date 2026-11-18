@@ -1,0 +1,6 @@
+{
+    "api": 1,
+    "entry": "plugin/main.lua",
+    "side": "client",
+    "permissions": ["skater.read", "skater.control", "skater.animation", "events.skater", "input", "session.read", "menu", "storage", "audio"]
+}

@@ -1,0 +1,7 @@
+{
+    "name": "Helicopter_Shove_It",
+    "version_number": "0.4.1",
+    "description": "Hold a pop shove-it to climb, hover, or dive in offline ReSkate. Works with nollies too. Flight needs the companion runtime.",
+    "dependencies": [],
+    "website_url": ""
+}
